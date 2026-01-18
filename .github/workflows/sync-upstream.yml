@@ -126,12 +126,17 @@ jobs:
       - name: Create issue on conflict
         if: steps.sync.outputs.status == 'conflict'
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        env:
+          CONFLICTING_FILES: ${{ steps.sync.outputs.conflicting_files }}
+          DIFF_CONTENT: ${{ steps.sync.outputs.diff_content }}
+          AHEAD: ${{ steps.sync.outputs.ahead }}
+          BEHIND: ${{ steps.sync.outputs.behind }}
         with:
           script: |
-            const conflictingFiles = `${{ steps.sync.outputs.conflicting_files }}`;
-            const diffContent = `${{ steps.sync.outputs.diff_content }}`;
-            const ahead = '${{ steps.sync.outputs.ahead }}';
-            const behind = '${{ steps.sync.outputs.behind }}';
+            const conflictingFiles = process.env.CONFLICTING_FILES || '';
+            const diffContent = process.env.DIFF_CONTENT || '';
+            const ahead = process.env.AHEAD || '0';
+            const behind = process.env.BEHIND || '0';
 
             // Check if there's already an open conflict issue
             const existingIssues = await github.rest.issues.listForRepo({
