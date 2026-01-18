@@ -90,24 +90,32 @@ jobs:
             git merge upstream/$BRANCH --no-commit || true
             CONFLICTING_FILES=$(git diff --name-only --diff-filter=U | head -20)
 
-            # Generate diff content for each conflicting file (truncated for readability)
+            # Generate conflict content showing the actual merge conflicts with markers
             DIFF_FILE=$(mktemp)
             for file in $CONFLICTING_FILES; do
-              echo "Generating diff for: $file"
-              # Show the diff between fork and upstream for this file
-              FILE_DIFF=$(git diff HEAD...upstream/$BRANCH -- "$file" 2>/dev/null | head -100)
-              if [ -n "$FILE_DIFF" ]; then
-                {
-                  echo "### \`${file}\`"
-                  echo "<details>"
-                  echo "<summary>Click to expand diff</summary>"
-                  echo ""
-                  echo "\`\`\`diff"
-                  echo "$FILE_DIFF"
-                  echo "\`\`\`"
-                  echo "</details>"
-                  echo ""
-                } >> "$DIFF_FILE"
+              echo "Extracting conflict for: $file"
+              # The file currently has conflict markers from the failed merge - extract them
+              if [ -f "$file" ]; then
+                # Extract the conflict sections (lines between <<<<<<< and >>>>>>>)
+                CONFLICT_CONTENT=$(grep -A 50 "^<<<<<<<" "$file" | head -100)
+                if [ -n "$CONFLICT_CONTENT" ]; then
+                  {
+                    echo "### \`${file}\`"
+                    echo ""
+                    echo "**Your version (HEAD)** is between \`<<<<<<<\` and \`=======\`"
+                    echo ""
+                    echo "**Upstream version** is between \`=======\` and \`>>>>>>>\`"
+                    echo ""
+                    echo "<details>"
+                    echo "<summary>Click to expand conflict</summary>"
+                    echo ""
+                    echo "\`\`\`"
+                    echo "$CONFLICT_CONTENT"
+                    echo "\`\`\`"
+                    echo "</details>"
+                    echo ""
+                  } >> "$DIFF_FILE"
+                fi
               fi
             done
 
@@ -164,8 +172,8 @@ jobs:
             ${conflictingFiles}
             \`\`\`
 
-            ### Diff Details (Upstream Changes)
-            ${diffContent || '_No diff content available_'}
+            ### Conflict Details
+            ${diffContent || '_No conflict details available_'}
 
             Please resolve these conflicts manually.`
               });
@@ -188,10 +196,12 @@ jobs:
             ${conflictingFiles}
             \`\`\`
 
-            ### Diff Details (Upstream Changes)
-            The following shows what upstream has changed in each conflicting file:
+            ### Conflict Details
+            The following shows the exact merge conflicts with markers:
+            - Lines between \`<<<<<<<\` and \`=======\` are **your changes**
+            - Lines between \`=======\` and \`>>>>>>>\` are **upstream changes**
 
-            ${diffContent || '_No diff content available_'}
+            ${diffContent || '_No conflict details available_'}
 
             ### How to Resolve
 
