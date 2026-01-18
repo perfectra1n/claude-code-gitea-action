@@ -1,0 +1,251 @@
+name: Sync Fork from Upstream
+
+on:
+  schedule:
+    # Run daily at 6:00 AM UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      sync_branch:
+        description: "Branch to sync (default: main)"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Sync from upstream anthropics/claude-code-action
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/anthropics/claude-code-action.git || true
+          git fetch upstream
+
+      - name: Sync with upstream
+        id: sync
+        run: |
+          BRANCH="${{ github.event.inputs.sync_branch || 'main' }}"
+          echo "Syncing branch: $BRANCH"
+
+          # Get current fork HEAD
+          FORK_HEAD=$(git rev-parse HEAD)
+          echo "Fork HEAD: $FORK_HEAD"
+
+          # Get upstream HEAD
+          UPSTREAM_HEAD=$(git rev-parse upstream/$BRANCH)
+          echo "Upstream HEAD: $UPSTREAM_HEAD"
+
+          # Check if already up to date
+          if [ "$FORK_HEAD" = "$UPSTREAM_HEAD" ]; then
+            echo "Already up to date with upstream"
+            echo "status=up-to-date" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Check for divergence
+          MERGE_BASE=$(git merge-base HEAD upstream/$BRANCH)
+          echo "Merge base: $MERGE_BASE"
+
+          # Count commits ahead/behind
+          AHEAD=$(git rev-list --count upstream/$BRANCH..HEAD)
+          BEHIND=$(git rev-list --count HEAD..upstream/$BRANCH)
+          echo "Fork is $AHEAD commits ahead and $BEHIND commits behind upstream"
+          echo "ahead=$AHEAD" >> $GITHUB_OUTPUT
+          echo "behind=$BEHIND" >> $GITHUB_OUTPUT
+
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "No new commits from upstream"
+            echo "status=up-to-date" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Try to merge upstream changes
+          echo "Attempting to merge upstream/$BRANCH..."
+          if git merge upstream/$BRANCH --no-edit; then
+            echo "Successfully merged upstream changes"
+            echo "status=merged" >> $GITHUB_OUTPUT
+            git push origin $BRANCH
+          else
+            echo "Merge conflict detected!"
+            echo "status=conflict" >> $GITHUB_OUTPUT
+            git merge --abort
+
+            # Get conflicting files for the issue
+            git merge upstream/$BRANCH --no-commit || true
+            CONFLICTING_FILES=$(git diff --name-only --diff-filter=U | head -20)
+
+            # Generate diff content for each conflicting file (truncated for readability)
+            DIFF_FILE=$(mktemp)
+            for file in $CONFLICTING_FILES; do
+              echo "Generating diff for: $file"
+              # Show the diff between fork and upstream for this file
+              FILE_DIFF=$(git diff HEAD...upstream/$BRANCH -- "$file" 2>/dev/null | head -100)
+              if [ -n "$FILE_DIFF" ]; then
+                {
+                  echo "### \`${file}\`"
+                  echo "<details>"
+                  echo "<summary>Click to expand diff</summary>"
+                  echo ""
+                  echo "\`\`\`diff"
+                  echo "$FILE_DIFF"
+                  echo "\`\`\`"
+                  echo "</details>"
+                  echo ""
+                } >> "$DIFF_FILE"
+              fi
+            done
+
+            git merge --abort || true
+
+            echo "conflicting_files<<EOF" >> $GITHUB_OUTPUT
+            echo "$CONFLICTING_FILES" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+
+            echo "diff_content<<EOF" >> $GITHUB_OUTPUT
+            cat "$DIFF_FILE" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            rm -f "$DIFF_FILE"
+          fi
+
+      - name: Create issue on conflict
+        if: steps.sync.outputs.status == 'conflict'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          script: |
+            const conflictingFiles = `${{ steps.sync.outputs.conflicting_files }}`;
+            const diffContent = `${{ steps.sync.outputs.diff_content }}`;
+            const ahead = '${{ steps.sync.outputs.ahead }}';
+            const behind = '${{ steps.sync.outputs.behind }}';
+
+            // Check if there's already an open conflict issue
+            const existingIssues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-sync-conflict'
+            });
+
+            if (existingIssues.data.length > 0) {
+              // Update existing issue
+              const issue = existingIssues.data[0];
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `## Sync Attempt Failed - ${new Date().toISOString().split('T')[0]}
+
+            A new sync attempt was made but conflicts still exist.
+
+            **Status:** This fork is ${ahead} commits ahead and ${behind} commits behind upstream.
+
+            **Conflicting files:**
+            \`\`\`
+            ${conflictingFiles}
+            \`\`\`
+
+            ### Diff Details (Upstream Changes)
+            ${diffContent || '_No diff content available_'}
+
+            Please resolve these conflicts manually.`
+              });
+              console.log(`Updated existing issue #${issue.number}`);
+            } else {
+              // Create new issue
+              const issue = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: '⚠️ Upstream Sync Conflict - Manual Resolution Required',
+                labels: ['upstream-sync-conflict'],
+                body: `## Upstream Sync Failed
+
+            The automated sync from [anthropics/claude-code-action](https://github.com/anthropics/claude-code-action) encountered merge conflicts.
+
+            **Status:** This fork is ${ahead} commits ahead and ${behind} commits behind upstream.
+
+            ### Conflicting Files
+            \`\`\`
+            ${conflictingFiles}
+            \`\`\`
+
+            ### Diff Details (Upstream Changes)
+            The following shows what upstream has changed in each conflicting file:
+
+            ${diffContent || '_No diff content available_'}
+
+            ### How to Resolve
+
+            1. Clone the repository locally
+            2. Add upstream remote:
+               \`\`\`bash
+               git remote add upstream https://github.com/anthropics/claude-code-action.git
+               git fetch upstream
+               \`\`\`
+            3. Merge and resolve conflicts:
+               \`\`\`bash
+               git merge upstream/main
+               # Resolve conflicts in your editor
+               git add .
+               git commit
+               git push
+               \`\`\`
+            4. Close this issue once resolved
+
+            ---
+            *This issue was automatically created by the upstream sync workflow.*`
+              });
+              console.log(`Created issue #${issue.data.number}`);
+            }
+
+      - name: Create sync summary
+        if: always()
+        run: |
+          echo "## Upstream Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Upstream:** [anthropics/claude-code-action](https://github.com/anthropics/claude-code-action)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          STATUS="${{ steps.sync.outputs.status }}"
+          AHEAD="${{ steps.sync.outputs.ahead }}"
+          BEHIND="${{ steps.sync.outputs.behind }}"
+
+          case "$STATUS" in
+            "up-to-date")
+              echo "✅ **Status:** Already up to date with upstream" >> $GITHUB_STEP_SUMMARY
+              ;;
+            "merged")
+              echo "✅ **Status:** Successfully merged $BEHIND commits from upstream" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Fork is $AHEAD commits ahead of upstream (local changes)." >> $GITHUB_STEP_SUMMARY
+              ;;
+            "conflict")
+              echo "❌ **Status:** Merge conflict detected" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Fork is $AHEAD commits ahead and $BEHIND commits behind upstream." >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "An issue has been created to track the conflict resolution." >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Conflicting files:**" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              echo "${{ steps.sync.outputs.conflicting_files }}" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              ;;
+            *)
+              echo "⚠️ **Status:** Unknown" >> $GITHUB_STEP_SUMMARY
+              ;;
+          esac
